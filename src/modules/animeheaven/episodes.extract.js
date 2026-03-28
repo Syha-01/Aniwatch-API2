@@ -7,7 +7,7 @@ export default function episodesExtract(html) {
   
   // They are listed in reverse order usually (from latest to earliest).
   // So we may want to reverse them or just push them.
-  $('.trackep0.watch').parent('a.c').each((i, el) => {
+  $('.trackep0.watch').parent('a').each((i, el) => {
     const obj = {
       title: null,
       alternativeTitle: null,
