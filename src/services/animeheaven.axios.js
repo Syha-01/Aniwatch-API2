@@ -1,10 +1,11 @@
 import config from '../config/config.js';
 
-export const axiosInstance = async (endpoint) => {
+export const axiosInstance = async (endpoint, options = {}) => {
   try {
     const response = await fetch('https://animeheaven.me' + endpoint, {
       headers: {
         ...(config.headers || {}),
+        ...(options.headers || {}),
       },
     });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
