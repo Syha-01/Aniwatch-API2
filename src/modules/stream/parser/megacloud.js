@@ -1,6 +1,5 @@
-import CryptoJS from 'crypto-js';
+import crypto from 'crypto';
 import config from '@/config/config.js';
-import extractToken from './token';
 
 const { baseurl } = config;
 
@@ -9,10 +8,12 @@ const { baseurl } = config;
 ======================= */
 const MAX_RETRIES = 2;
 const TIMEOUT = 15000;
-const KEY_CACHE_DURATION = 60 * 60 * 1000; // 1 hour
 
-const KEY_URL =
-  'https://raw.githubusercontent.com/ryanwtf88/megacloud-keys/refs/heads/master/key.txt';
+const MEGACLOUD_SCRIPT = 'https://megacloud.tv/js/player/a/prod/e1-player.min.js?v=';
+const MEGACLOUD_SOURCES = 'https://megacloud.tv/embed-2/ajax/e-1/getSources?id=';
+
+const MEGAPLAY = 'https://megaplay.buzz/stream/s-2/';
+const VIDWISH = 'https://vidwish.live/stream/s-2/';
 
 const FALLBACK_PROVIDERS = [
   { name: 'megaplay', domain: 'megaplay.buzz' },
@@ -20,7 +21,7 @@ const FALLBACK_PROVIDERS = [
 ];
 
 /* =======================
-   FETCH HELPERS (BUN)
+   FETCH HELPERS
 ======================= */
 const fetchJSON = async (url, { headers = {}, timeout = TIMEOUT } = {}) => {
   const controller = new AbortController();
@@ -63,57 +64,193 @@ const fetchText = async (url, { headers = {}, timeout = TIMEOUT } = {}) => {
 };
 
 /* =======================
-   KEY CACHE
-======================= */
-let cachedKey = null;
-let keyLastFetched = 0;
-
-/* =======================
    PUBLIC API
 ======================= */
 export default async function megacloud({ selectedServer, id }, retry = 0) {
-  const epID = extractEpisodeId(id);
-
   try {
-    const [sourcesResponse, key] = await Promise.all([
-      fetchAjaxSources(selectedServer.id),
-      getDecryptionKey(),
-    ]);
+    // 1. Get the embed link from the ajax sources endpoint
+    const sourcesResponse = await fetchAjaxSources(selectedServer.id);
+    const embedLink = sourcesResponse.link;
 
-    const { baseUrl, sourceId } = parseAjaxLink(sourcesResponse.link);
+    // Extract the video hash from the embed link (works with megacloud.blog, megacloud.tv, etc.)
+    const videoId = embedLink.split('/').pop()?.split('?')[0];
+    if (!videoId) throw new Error('Could not extract video ID from embed link');
 
-    let decrypted;
-    let rawData;
-    let usedFallback = false;
+    // 2. Get the sources from the megacloud getSources endpoint
+    const srcsData = await fetchJSON(MEGACLOUD_SOURCES + videoId, {
+      headers: {
+        Accept: '*/*',
+        'X-Requested-With': 'XMLHttpRequest',
+        'User-Agent': config.headers['User-Agent'],
+        Referer: `https://megacloud.tv/embed-2/e-1/${videoId}?k=1`,
+      },
+    });
 
-    try {
-      ({ sources: decrypted, rawData } = await decryptPrimarySource(baseUrl, sourceId, key));
-    } catch {
-      ({ sources: decrypted, rawData } = await getFallbackSource(
-        epID,
-        selectedServer.type,
-        selectedServer.name
-      ));
-      usedFallback = true;
+    if (!srcsData) throw new Error('No sources data returned');
+
+    const encryptedString = srcsData.sources;
+
+    // 3. If sources are not encrypted, return them directly
+    if (!srcsData.encrypted && Array.isArray(encryptedString)) {
+      return buildResult({
+        id,
+        server: selectedServer,
+        file: encryptedString[0]?.file,
+        rawData: srcsData,
+        usedFallback: false,
+      });
     }
 
-    validateSources(decrypted);
+    // 4. Sources are encrypted - fetch the player script and extract variables
+    const scriptText = await fetchText(MEGACLOUD_SCRIPT + Date.now().toString());
+    if (!scriptText) throw new Error("Couldn't fetch player script");
+
+    const vars = extractVariables(scriptText);
+    if (!vars.length) throw new Error("Can't find variables in player script");
+
+    // 5. Use variables to separate secret from encrypted source
+    const { secret, encryptedSource } = getSecret(encryptedString, vars);
+
+    // 6. Decrypt using AES-256-CBC with OpenSSL key derivation
+    const decrypted = decrypt(encryptedSource, secret);
+    const sources = JSON.parse(decrypted);
+
+    if (!sources?.[0]?.file) throw new Error('No file in decrypted sources');
 
     return buildResult({
       id,
       server: selectedServer,
-      file: decrypted[0].file,
-      rawData,
-      usedFallback,
+      file: sources[0].file,
+      rawData: srcsData,
+      usedFallback: false,
     });
   } catch (err) {
-    console.error(err.message);
+    console.error(`megacloud attempt ${retry + 1}:`, err.message);
+
     if (retry < MAX_RETRIES) {
       await backoff(retry);
       return megacloud({ selectedServer, id }, retry + 1);
     }
+
+    // Try fallback providers as last resort
+    try {
+      const epID = id.split('ep=').pop();
+      const { sources, rawData } = await getFallbackSource(
+        epID,
+        selectedServer.type,
+        selectedServer.name
+      );
+      if (sources?.[0]?.file) {
+        return buildResult({
+          id,
+          server: selectedServer,
+          file: sources[0].file,
+          rawData,
+          usedFallback: true,
+        });
+      }
+    } catch {
+      // fallback also failed
+    }
+
     return null;
   }
+}
+
+/* =======================
+   VARIABLE EXTRACTION
+   (from player script)
+======================= */
+
+function extractVariables(text) {
+  const regex =
+    /case\s*0x[0-9a-f]+:(?![^;]*=partKey)\s*\w+\s*=\s*(\w+)\s*,\s*\w+\s*=\s*(\w+);/g;
+  const matches = text.matchAll(regex);
+  const vars = Array.from(matches, (match) => {
+    const matchKey1 = matchingKey(match[1], text);
+    const matchKey2 = matchingKey(match[2], text);
+    try {
+      return [parseInt(matchKey1, 16), parseInt(matchKey2, 16)];
+    } catch (e) {
+      return [];
+    }
+  }).filter((pair) => pair.length > 0);
+
+  return vars;
+}
+
+function matchingKey(value, script) {
+  const regex = new RegExp(`,${value}=((?:0x)?([0-9a-fA-F]+))`);
+  const match = script.match(regex);
+  if (match) {
+    return match[1].replace(/^0x/, '');
+  } else {
+    throw new Error('Failed to match the key');
+  }
+}
+
+/* =======================
+   SECRET EXTRACTION
+======================= */
+
+function getSecret(encryptedString, values) {
+  let secret = '',
+    encryptedSource = '',
+    encryptedSourceArray = encryptedString.split(''),
+    currentIndex = 0;
+
+  for (const index of values) {
+    const start = index[0] + currentIndex;
+    const end = start + index[1];
+
+    for (let i = start; i < end; i++) {
+      secret += encryptedString[i];
+      encryptedSourceArray[i] = '';
+    }
+    currentIndex += index[1];
+  }
+
+  encryptedSource = encryptedSourceArray.join('');
+
+  return { secret, encryptedSource };
+}
+
+/* =======================
+   AES DECRYPTION
+   (OpenSSL-compatible)
+======================= */
+
+function decrypt(encrypted, keyOrSecret, maybe_iv) {
+  let key;
+  let iv;
+  let contents;
+
+  if (maybe_iv) {
+    key = keyOrSecret;
+    iv = maybe_iv;
+    contents = encrypted;
+  } else {
+    const cypher = Buffer.from(encrypted, 'base64');
+    const salt = cypher.subarray(8, 16);
+    const password = Buffer.concat([Buffer.from(keyOrSecret, 'binary'), salt]);
+
+    const md5Hashes = [];
+    let digest = password;
+    for (let i = 0; i < 3; i++) {
+      md5Hashes[i] = crypto.createHash('md5').update(digest).digest();
+      digest = Buffer.concat([md5Hashes[i], password]);
+    }
+    key = Buffer.concat([md5Hashes[0], md5Hashes[1]]);
+    iv = md5Hashes[2];
+    contents = cypher.subarray(16);
+  }
+
+  const decipher = crypto.createDecipheriv('aes-256-cbc', key, iv);
+  const decrypted =
+    decipher.update(contents, typeof contents === 'string' ? 'base64' : undefined, 'utf8') +
+    decipher.final();
+
+  return decrypted;
 }
 
 /* =======================
@@ -125,45 +262,6 @@ const fetchAjaxSources = async (serverId) => {
 
   if (!data?.link) throw new Error('Missing ajax link');
   return data;
-};
-
-const parseAjaxLink = (link) => {
-  const sourceId = /\/([^/?]+)\?/.exec(link)?.[1];
-  const baseUrl = link.match(/^(https?:\/\/[^/]+(?:\/[^/]+){3})/)?.[1];
-
-  if (!sourceId || !baseUrl) {
-    throw new Error('Invalid ajax link format');
-  }
-
-  return { sourceId, baseUrl };
-};
-
-const decryptPrimarySource = async (baseUrl, sourceId, key) => {
-  const token = await extractToken(`${baseUrl}/${sourceId}?k=1&autoPlay=0&oa=0&asi=1`);
-  if (!token) throw new Error('Token extraction failed');
-
-  const data = await fetchJSON(`${baseUrl}/getSources?id=${sourceId}&_k=${token}`, {
-    headers: {
-      'X-Requested-With': 'XMLHttpRequest',
-      Referer: `${baseUrl}/${sourceId}`,
-    },
-  });
-
-  const encrypted = data?.sources;
-  if (!encrypted) throw new Error('Missing encrypted sources');
-
-  const sources = typeof encrypted === 'string' ? decryptAES(encrypted, key) : encrypted;
-
-  return { sources, rawData: data };
-};
-
-const decryptAES = (encrypted, key) => {
-  const tryDecrypt = (k) => CryptoJS.AES.decrypt(encrypted, k).toString(CryptoJS.enc.Utf8);
-
-  const decrypted = tryDecrypt(key) || tryDecrypt(CryptoJS.enc.Hex.parse(key));
-
-  if (!decrypted) throw new Error('AES decryption failed');
-  return JSON.parse(decrypted);
 };
 
 /* =======================
@@ -224,39 +322,8 @@ const fetchFallbackSources = async (provider, id) => {
 const extractDataId = (html) => html.match(/data-id=["'](\d+)["']/)?.[1];
 
 /* =======================
-   KEY MANAGEMENT
-======================= */
-
-const getDecryptionKey = async () => {
-  const now = Date.now();
-
-  if (cachedKey && now - keyLastFetched < KEY_CACHE_DURATION) {
-    return cachedKey;
-  }
-
-  try {
-    const data = await fetchText(KEY_URL);
-    cachedKey = data.trim();
-    keyLastFetched = now;
-    return cachedKey;
-  } catch (err) {
-    console.error(err.message);
-    if (cachedKey) return cachedKey;
-    throw new Error('Key fetch failed');
-  }
-};
-
-/* =======================
    UTIL
 ======================= */
-
-const extractEpisodeId = (id) => id.split('ep=').pop();
-
-const validateSources = (sources) => {
-  if (!sources?.[0]?.file) {
-    throw new Error('Invalid decrypted sources');
-  }
-};
 
 const buildResult = ({ id, server, file, rawData, usedFallback }) => ({
   id,

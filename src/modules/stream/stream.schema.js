@@ -37,7 +37,7 @@ const streamSchema = createRoute({
   path: 'stream',
   request: {
     query: z.object({
-      server: z.enum(['hd-1', 'hd-2', 'hd-3', 'vidsrc', 'megacloud', 't-cloud', 'megaplay', 'vidwish']).default('megaplay'),
+      server: z.enum(['hd-1', 'hd-2', 'hd-3', 'vidsrc', 'megacloud', 't-cloud', 'megaplay', 'vidwish']).default('megacloud'),
       type: z.enum(['sub', 'dub']).default('sub'),
       id: z.string().openapi({ examples: someAnimes.episodesIds }),
     }),
