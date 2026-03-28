@@ -22,6 +22,7 @@ import * as monthlySchedule from '../modules/schedule/monthlySchedule/index';
 import * as nextEpSchedule from '../modules/schedule/nextEpSchedule/index';
 import * as meta from '../modules/meta/index';
 import withTryCatch from '@/utils/withTryCatch';
+import animeHeavenRouter from './animeheaven.route.js';
 
 const router = createRouter();
 
@@ -52,5 +53,7 @@ const routes = [
 routes.forEach((route) => {
   router.openapi(route.schema, withTryCatch(route.handler));
 });
+
+router.route('/animeheaven', animeHeavenRouter);
 
 export default router;
